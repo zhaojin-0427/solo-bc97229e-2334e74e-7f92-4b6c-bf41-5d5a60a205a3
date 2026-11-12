@@ -38,14 +38,15 @@ done
 echo "$detail" | pp
 
 echo "==> 4) 取消演示（对含慢查询的新批次发起取消）"
-cancel_resp="$(curl -fsS -X POST "$BASE/batches" \
+cancel_resp="$(curl -sS -X POST "$BASE/batches" \
   -F "db_file=@$DB;type=application/x-sqlite3" \
   -F "rules=< $RULES" \
   -F "name=cancel-demo")"
 cbid="$(printf '%s' "$cancel_resp" | \
   { command -v jq >/dev/null 2>&1 && jq -r .id || python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; })"
 sleep 1
-curl -fsS -X POST "$BASE/batches/$cbid/cancel" | pp
+# 运行中取消返回 200；若批次已到终态则服务端明确返回 409（拒绝取消、报告保留）
+curl -sS -X POST "$BASE/batches/$cbid/cancel" -w "\nHTTP %{http_code}\n" | pp || true
 sleep 2
 echo "--- 被取消批次的最终报告（注意 can_load 必为 false）---"
 curl -fsS "$BASE/batches/$cbid" | pp

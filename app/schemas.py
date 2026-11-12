@@ -63,9 +63,13 @@ class BatchDetail(BatchSummary):
 class CancelResponse(BaseModel):
     batch_id: str
     cancelled_signal_sent: bool = Field(
-        ..., description="true=取消信号已送达运行中的批次；false=批次已结束/不存在"
+        ...,
+        description=(
+            "true=取消请求已被接受（仅 HTTP 200 时出现）；终态批次的取消"
+            "由 HTTP 409 明确拒绝，不会返回 false 形式的 200 响应"
+        ),
     )
-    status: str
+    status: str = Field(..., description="裁决后控制库中的批次状态（接受时为 cancelled）")
     message: str
 
 

@@ -27,8 +27,12 @@ _FORBIDDEN_PATTERN = re.compile(
 )
 
 
-class UploadError(ValueError):
-    """上传内容不合法（映射为 HTTP 400）。"""
+class UploadError(Exception):
+    """上传内容不合法（由路由层统一映射为 HTTP 400）。
+
+    历史上继承 ValueError，但 Starlette 默认只把 HTTPException 转成 4xx，
+    普通异常会变成 500；因此这里改为 Exception，并由 main.py 注册显式处理器。
+    """
 
 
 def validate_sqlite_file(path: str | Path, max_bytes: int) -> None:
@@ -65,15 +69,18 @@ def validate_sqlite_file(path: str | Path, max_bytes: int) -> None:
 
 
 def _validate_required_tables(conn: sqlite3.Connection) -> None:
+    # open_readonly_connection 不保证设置 row_factory（不同调用方配置不同），
+    # 这里统一按位置取值，避免在 tuple 行上使用字符串索引触发 TypeError。
     existing = {
-        r["name"]
-        for r in conn.execute(
+        row[0]
+        for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
         ).fetchall()
     }
     for table, required_cols in REQUIRED_TABLES.items():
         if table not in existing:
             raise UploadError(f"上传库缺少必需表: {table}")
+        # PRAGMA table_info 的列：cid, name, type, notnull, dflt_value, pk
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         missing = required_cols - cols
         if missing:
@@ -105,11 +112,13 @@ def explain_rule_sql(db_path: str | Path, sql: str) -> None:
     """在上传库上做一次 EXPLAIN 静态解析（不实际产出结果集）。
 
     用于提交阶段提前发现列名 / 表名错误；EXPLAIN 为只读操作。
+    注意 sqlite3.Warning 并非 sqlite3.Error 的子类（EXPLAIN 搭配非 SELECT
+    语句时驱动会抛 Warning），必须一并捕获并映射为 400。
     """
     conn = open_readonly_connection(db_path)
     try:
         conn.execute(f"EXPLAIN {sql}").fetchall()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, sqlite3.Warning) as exc:
         raise UploadError(f"规则 SQL 无法在上传库上解析: {exc}") from exc
     finally:
         conn.close()

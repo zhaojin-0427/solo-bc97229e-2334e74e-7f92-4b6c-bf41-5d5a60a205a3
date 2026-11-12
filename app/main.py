@@ -20,8 +20,8 @@ from typing import Any, Optional
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import __version__, config, runner, storage, validation
 from .schemas import (
@@ -55,6 +55,12 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(validation.UploadError)
+async def upload_error_handler(_: Request, exc: validation.UploadError) -> JSONResponse:
+    """上传 / 规则内容不合法统一映射为 400，避免落入默认 500。"""
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 # ---------------- 报告组装 ----------------
@@ -267,31 +273,58 @@ def get_batch(batch_id: str) -> BatchDetail:
     response_model=CancelResponse,
     tags=["核查批次"],
     summary="取消整批（中断该批实际计算，迟到结果不得改写为完成）",
+    responses={
+        409: {
+            "description": "批次已到终态（completed/cancelled/interrupted），"
+            "取消被明确拒绝，既有报告原样保留",
+        }
+    },
 )
 def cancel_batch(batch_id: str) -> CancelResponse:
     batch_row = storage.get_batch_row(batch_id)
     if batch_row is None:
         raise HTTPException(status_code=404, detail=f"批次不存在: {batch_id}")
 
-    signal_sent = runner.request_cancel(batch_id)
-    if not signal_sent:
+    verdict = runner.request_cancel(batch_id)
+    outcome = verdict["outcome"]
+
+    if outcome == runner.CANCEL_ACCEPTED:
         return CancelResponse(
             batch_id=batch_id,
-            cancelled_signal_sent=False,
-            status=batch_row["status"],
+            cancelled_signal_sent=True,
+            status=verdict["status"],
             message=(
-                "批次不在运行中（可能已完成 / 已取消 / 重启后中断），"
-                "无需取消；当前状态不允许自动放行"
+                "取消请求已被接受：取消信号已送达并正在中断该批实际计算，"
+                "批次终态为 cancelled，未完成规则标记 cancelled，不会给出可入仓结论"
             ),
         )
-    return CancelResponse(
-        batch_id=batch_id,
-        cancelled_signal_sent=True,
-        status=batch_row["status"],
-        message=(
-            "取消信号已送达，正在中断该批实际计算；未完成规则将标记 cancelled，"
-            "批次不会给出可入仓结论"
-        ),
+
+    # 任何拒绝路径都必须如实说明，绝不在无法停止计算时回报成功
+    if outcome == runner.CANCEL_REJECTED_UNREGISTERED:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "batch_id": batch_id,
+                "status": verdict["status"],
+                "message": (
+                    "批次记录仍在运行态，但本进程没有它的执行登记"
+                    "（例如服务重启后遗留），无法远程中断；重启恢复会将其"
+                    "标记为 interrupted，不可放行"
+                ),
+            },
+        )
+
+    # CANCEL_REJECTED_TERMINAL：完成先落库或已取消/中断，明确拒绝并保留报告
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "batch_id": batch_id,
+            "status": verdict["status"],
+            "message": (
+                "批次已到终态，取消被拒绝且报告保持不变；"
+                "是否可入仓以当前报告的 can_load 为准"
+            ),
+        },
     )
 
 
@@ -304,41 +337,128 @@ _DEMO_HTML = """
 <!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8">
-<title>核查服务演示指引</title>
+<title>核查服务交互控制台</title>
 <style>
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:900px;
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:980px;
 margin:2rem auto;padding:0 1rem;line-height:1.6;color:#1f2937}
 code,pre{background:#f3f4f6;border-radius:6px}
-code{padding:.1rem .35rem} pre{padding:1rem;overflow-x:auto}
+code{padding:.1rem .35rem} pre{padding:1rem;overflow-x:auto;white-space:pre-wrap}
 h1,h2{color:#111827} .ok{color:#047857;font-weight:600}
 .bad{color:#b91c1c;font-weight:600}
+.card{border:1px solid #d1d5db;border-radius:10px;padding:1rem 1.25rem;margin:1rem 0}
+label{display:block;font-weight:600;margin:.6rem 0 .25rem}
+input[type=text],input[type=file],textarea,button{font:inherit;width:100%;
+box-sizing:border-box}
+input[type=text],textarea{border:1px solid #9ca3af;border-radius:6px;padding:.5rem}
+textarea{min-height:150px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9rem}
+button{background:#2563eb;color:#fff;border:0;border-radius:6px;padding:.6rem;
+cursor:pointer;margin-top:.8rem;width:auto;min-width:10rem}
+button:hover{background:#1d4ed8}
+button.ghost{background:#6b7280} button.danger{background:#dc2626}
+button.danger:hover{background:#b91c1c}
+.row{display:flex;gap:.6rem;align-items:center}
+.row input{flex:1} .muted{color:#6b7280;font-size:.9rem}
 </style></head>
 <body>
-<h1>临床试验数据核查服务 · 演示指引</h1>
-<ol>
-<li>打开 <a href="/docs">Swagger UI（/docs）</a>，所有接口可在线 Try it out。</li>
-<li>用 <code>demo/make_sample_db.py</code> 生成含违规数据的 SQLite 副本，
-用 <code>demo/rules.sample.json</code> 作为具名查询。</li>
-<li>调用 <code>POST /batches</code>：<code>db_file</code> 选 db 文件，
-<code>rules</code> 粘贴 JSON，执行后得到 <code>id</code>。</li>
-<li>轮询 <code>GET /batches/{id}</code> 查看每条规则结论、违规总数与前 20 行。</li>
-<li>对耗时批次调用 <code>POST /batches/{id}/cancel</code> 演示取消。</li>
-</ol>
-<h2>curl 示例</h2>
-<pre>
-curl -X POST http://localhost:8000/batches \\
-  -F "db_file=@demo/sample_ctms.db" \\
-  -F "rules=&lt;demo/rules.sample.json" \\
-  -F "name=方案A-首次核查"
+<h1>临床试验数据核查服务 · 交互控制台</h1>
+<p class="muted">本页面直接调用同源 API：可提交访视 SQLite 副本、轮询报告、取消批次。
+完整 OpenAPI 交互文档见 <a href="/docs">Swagger UI（/docs）</a>。</p>
 
-curl http://localhost:8000/batches
-curl http://localhost:8000/batches/BATCH_ID
-curl -X POST http://localhost:8000/batches/BATCH_ID/cancel
-</pre>
+<div class="card">
+<h2>1. 提交核查批次（POST /batches）</h2>
+<label for="db_file">SQLite 副本（含 subjects / visits 表）</label>
+<input id="db_file" type="file" accept=".db,.sqlite,.sqlite3,application/x-sqlite3">
+<label for="rules">规则 JSON（具名只读查询数组）</label>
+<textarea id="rules">[{"name":"all_subjects_have_visits","sql":"SELECT s.id FROM subjects s LEFT JOIN visits v ON v.subject_id = s.id GROUP BY s.id HAVING COUNT(v.id) = 0"}]</textarea>
+<label for="name">批次名称（可选）</label>
+<input id="name" type="text" placeholder="例如：方案A-首次核查">
+<button onclick="createBatch()">提交核查</button>
+<pre id="create_out">尚未提交</pre>
+</div>
+
+<div class="card">
+<h2>2. 读取报告（GET /batches/{id}）</h2>
+<div class="row">
+<input id="get_id" type="text" placeholder="批次 id">
+<button onclick="getBatch()">读取报告</button>
+<button class="ghost" onclick="pollBatch()">轮询直到终态</button>
+</div>
+<pre id="get_out">输入批次 id 后查询</pre>
+</div>
+
+<div class="card">
+<h2>3. 取消批次（POST /batches/{id}/cancel）</h2>
+<div class="row">
+<input id="cancel_id" type="text" placeholder="运行中批次的 id">
+<button class="danger" onclick="cancelBatch()">取消整批</button>
+</div>
+<pre id="cancel_out">仅运行中批次可取消；终态批次会收到 409 拒绝</pre>
+</div>
+
+<div class="card">
 <h2>放行规则</h2>
 <p><span class="ok">can_load=true</span> 当且仅当批次
 <code>completed</code> 且所有规则 <code>passed</code>（零行）。
-超时 timeout、出错 error、取消 cancelled、中断 interrupted
-<span class="bad">一律不可放行</span>。</p>
+timeout、error、cancelled、interrupted
+<span class="bad">一律不可放行</span>。取消请求被接受后，批次最终必为
+<code>cancelled</code>；完成先落库时取消返回 <code>409</code> 且报告保持不变。</p>
+</div>
+
+<script>
+function show(id, value){
+  document.getElementById(id).textContent =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+async function createBatch(){
+  const fileInput = document.getElementById("db_file");
+  if(!fileInput.files.length){ show("create_out", "请先选择 SQLite 文件"); return; }
+  let rulesText = document.getElementById("rules").value;
+  try { JSON.parse(rulesText); }
+  catch(e){ show("create_out", "规则 JSON 不合法: " + e); return; }
+  const fd = new FormData();
+  fd.append("db_file", fileInput.files[0]);
+  fd.append("rules", rulesText);
+  const name = document.getElementById("name").value.trim();
+  if(name) fd.append("name", name);
+  try{
+    const resp = await fetch("/batches", {method:"POST", body: fd});
+    const data = await resp.json();
+    if(resp.ok && data.id){
+      document.getElementById("get_id").value = data.id;
+      document.getElementById("cancel_id").value = data.id;
+    }
+    show("create_out", "HTTP " + resp.status + "\\n" + JSON.stringify(data, null, 2));
+  }catch(e){ show("create_out", "请求失败: " + e); }
+}
+async function getBatch(){
+  const id = document.getElementById("get_id").value.trim();
+  if(!id){ show("get_out", "请输入批次 id"); return; }
+  try{
+    const resp = await fetch("/batches/" + encodeURIComponent(id));
+    const data = await resp.json();
+    show("get_out", "HTTP " + resp.status + "\\n" + JSON.stringify(data, null, 2));
+    return data;
+  }catch(e){ show("get_out", "请求失败: " + e); }
+}
+async function pollBatch(){
+  for(let i=0;i<30;i++){
+    const data = await getBatch();
+    if(data && !["queued","running"].includes(data.status)) return;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  show("get_out", document.getElementById("get_out").textContent +
+    "\\n[轮询超时，仍未到终态]");
+}
+async function cancelBatch(){
+  const id = document.getElementById("cancel_id").value.trim();
+  if(!id){ show("cancel_out", "请输入批次 id"); return; }
+  try{
+    const resp = await fetch("/batches/" + encodeURIComponent(id) + "/cancel",
+                             {method:"POST"});
+    const data = await resp.json();
+    show("cancel_out", "HTTP " + resp.status + "\\n" + JSON.stringify(data, null, 2));
+  }catch(e){ show("cancel_out", "请求失败: " + e); }
+}
+</script>
 </body></html>
 """

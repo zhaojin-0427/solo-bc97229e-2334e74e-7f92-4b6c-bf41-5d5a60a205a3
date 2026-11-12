@@ -189,6 +189,89 @@ def set_batch_status(batch_id: str, status: str, error: Optional[str] = None) ->
         )
 
 
+def mark_batch_running(batch_id: str) -> bool:
+    """仅当批次仍处于 queued 时迁移为 running。
+
+    取消可能在工作线程被线程池调度前就已落库，这里用条件更新兜底：
+    已取消的批次不会被重新“激活”为 running。返回是否迁移成功。
+    """
+    now = utcnow_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE batches
+               SET status = ?, started_at = COALESCE(started_at, ?)
+             WHERE id = ? AND status = ?
+            """,
+            (BATCH_RUNNING, now, batch_id, BATCH_QUEUED),
+        )
+        return cur.rowcount == 1
+
+
+def mark_batch_cancelled(
+    batch_id: str, error: str, expect_statuses: tuple[str, ...]
+) -> bool:
+    """原子地把批次裁决为 cancelled。
+
+    仅当当前状态仍属于 expect_statuses（运行态 queued/running）时才更新，
+    已落库的终态（completed/cancelled/interrupted）绝不被覆盖。
+    返回是否赢得裁决（True=取消生效）。
+    """
+    now = utcnow_iso()
+    placeholders = ",".join("?" for _ in expect_statuses)
+    with connect() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE batches
+               SET status = ?, finished_at = ?,
+                   error = COALESCE(error, ?)
+             WHERE id = ? AND status IN ({placeholders})
+            """,
+            (BATCH_CANCELLED, now, error, batch_id, *expect_statuses),
+        )
+        return cur.rowcount == 1
+
+
+def mark_batch_completed(batch_id: str, error: Optional[str]) -> bool:
+    """仅当批次仍处于 running 时落库 completed。
+
+    收尾窗口若取消已经把状态改成 cancelled，本条件更新返回 False，
+    “完成”结论无法覆盖“取消”终态，迟到完成不会再给出可入仓结论。
+    """
+    now = utcnow_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE batches
+               SET status = ?, finished_at = ?, error = COALESCE(?, error)
+             WHERE id = ? AND status = ?
+            """,
+            (BATCH_COMPLETED, now, error, batch_id, BATCH_RUNNING),
+        )
+        return cur.rowcount == 1
+
+
+def mark_batch_interrupted(batch_id: str, error: str) -> bool:
+    """仅当批次仍处于运行态（queued/running）时落库 interrupted。
+
+    编排层异常兜底使用：取消已先落 cancelled 时本更新落空，
+    保证异常路径不会覆盖任何已裁决终态。
+    """
+    now = utcnow_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE batches
+               SET status = ?, finished_at = ?,
+                   error = COALESCE(error, ?)
+             WHERE id = ? AND status IN (?, ?)
+            """,
+            (BATCH_INTERRUPTED, now, error, batch_id,
+             BATCH_QUEUED, BATCH_RUNNING),
+        )
+        return cur.rowcount == 1
+
+
 def get_batch_row(batch_id: str) -> Optional[sqlite3.Row]:
     with connect() as conn:
         return conn.execute(
@@ -244,3 +327,26 @@ def get_rule_rows(batch_id: str) -> list[sqlite3.Row]:
             "SELECT * FROM rule_results WHERE batch_id = ? ORDER BY seq",
             (batch_id,),
         ).fetchall()
+
+
+def mark_pending_rules_cancelled(batch_id: str, from_seq: int = 0) -> int:
+    """把批次内仍未产生结论（queued/running）的规则统一标记为 cancelled。
+
+    幂等：已经落库的结论（passed/violations/timeout/error 等）保持不变，
+    迟到结果不能改写，取消只回收“尚未裁决”的规则。返回被标记的行数。
+    """
+    now = utcnow_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE rule_results
+               SET status = ?, finished_at = COALESCE(finished_at, ?),
+                   error_message = COALESCE(
+                       error_message, '批次被取消，该规则未执行或结果作废')
+             WHERE batch_id = ?
+               AND seq >= ?
+               AND status IN ('queued', 'running')
+            """,
+            (RULE_CANCELLED, now, batch_id, from_seq),
+        )
+        return cur.rowcount

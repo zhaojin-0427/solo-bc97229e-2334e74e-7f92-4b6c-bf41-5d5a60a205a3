@@ -201,10 +201,20 @@ def test_cancel_registry() -> None:
     bid = "batch-reg-1"
     event = registry.register(bid)
     check(not event.is_set(), "注册后初始未取消")
-    check(request_cancel(bid) is True, "运行中批次可发送取消信号")
+    storage.insert_batch(
+        bid, "注册表批次", "fixture.db", "/tmp/fixture.db",
+        [{"name": "r1", "sql": "SELECT 1"}],
+    )
+    storage.set_batch_status(bid, storage.BATCH_RUNNING)
+    verdict = request_cancel(bid)
+    check(verdict["outcome"] == "accepted" and verdict["status"] == "cancelled",
+          f"运行中批次取消被接受（实际 {verdict}）")
     check(event.is_set() and registry.is_cancelled(bid), "事件已置位")
+    check(storage.get_batch_row(bid)["status"] == storage.BATCH_CANCELLED,
+          "接受取消后控制库立即落 cancelled 终态")
     registry.unregister(bid)
-    check(request_cancel(bid) is False, "已注销批次取消返回 False（不伪造成功）")
+    check(request_cancel(bid)["outcome"] == "rejected_terminal",
+          "已终态批次取消被明确拒绝（不伪造成功）")
 
 
 def test_late_result_guard(db: Path) -> None:
@@ -229,10 +239,11 @@ def test_late_result_guard(db: Path) -> None:
     th = threading.Thread(target=worker)
     th.start()
     time.sleep(0.3)
-    # 模拟用户取消：先置事件，再把批次终态写为 cancelled
-    request_cancel(bid)
-    storage.set_batch_status(bid, storage.BATCH_CANCELLED,
-                             error="用户取消整批")
+    # 模拟用户取消：request_cancel 会置事件并把控制库终态原子落为 cancelled
+    verdict = request_cancel(bid)
+    check(verdict["outcome"] == "accepted", f"取消被接受（实际 {verdict}）")
+    check(storage.get_batch_row(bid)["status"] == storage.BATCH_CANCELLED,
+          "取消接受即落 cancelled 终态")
     th.join(timeout=5.0)
     check(not th.is_alive(), "取消后计算线程退出")
     check(holder["out"].status == storage.RULE_CANCELLED,

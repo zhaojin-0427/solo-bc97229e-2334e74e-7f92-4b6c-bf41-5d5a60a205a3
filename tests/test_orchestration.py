@@ -117,18 +117,21 @@ def main() -> int:
     runner.QUERY_TIMEOUT_SECONDS = 30
     runner.submit_batch(b4)
     time.sleep(0.5)
-    ok = runner.request_cancel(b4)
-    check(ok is True, "取消信号送达运行中批次")
+    verdict = runner.request_cancel(b4)
+    check(verdict["outcome"] == runner.CANCEL_ACCEPTED,
+          f"取消信号送达运行中批次并被接受（实际 {verdict}）")
+    check(verdict["status"] == storage.BATCH_CANCELLED, "接受即落 cancelled 终态")
     check(wait_terminal(b4, timeout=10) == storage.BATCH_CANCELLED, "批次终态 cancelled")
     rules = storage.get_rule_rows(b4)
     statuses = [r["status"] for r in rules]
     check(storage.RULE_CANCELLED in statuses, "未完成规则标记 cancelled")
-    check(storage.RULE_PASSED not in statuses or statuses[0] != storage.RULE_PASSED
-          or True, "规则状态序列: " + ",".join(statuses))
     check(all(s != storage.RULE_VIOLATIONS for s in statuses),
           "取消后不会出现迟到的 violations 完成结论")
-    # 对已终态批次再次取消 -> False，不伪造
-    check(runner.request_cancel(b4) is False, "终态批次再次取消返回 False")
+    # 对已终态批次再次取消 -> 明确拒绝，不伪造
+    again = runner.request_cancel(b4)
+    check(again["outcome"] == runner.CANCEL_REJECTED_TERMINAL
+          and again["status"] == storage.BATCH_CANCELLED,
+          f"终态批次再次取消被拒绝（实际 {again}）")
 
     print("== 并发：两个批次同时运行互不阻塞 ==")
     bx, by = "e2e-par-1", "e2e-par-2"
@@ -163,32 +166,181 @@ def main() -> int:
     rows = storage.list_batch_rows()
     check(len(rows) >= 6, f"批次列表持久化完整（{len(rows)} 条）")
 
-    print("== 收尾窗口取消：最后一条规则结束后取消，批次仍为 cancelled ==")
-    b6 = "e2e-late-cancel"
-    storage.insert_batch(b6, "late", "clean.db", str(db_clean), good_rule)
-    event = registry.register(b6)
-    storage.set_batch_status(b6, storage.BATCH_RUNNING)
-    # 直接驱动内部流程：先执行规则（很快），再在收尾前置取消
-    from app.engine import execute_rule
-    rule_row = storage.get_rule_rows(b6)[0]
-    out = execute_rule(str(db_clean), rule_row["sql_text"], event, timeout_seconds=5)
-    check(out.status == storage.RULE_PASSED, "规则本身确实零行通过")
-    # 模拟取消信号在规则落库前到达
-    registry.cancel(b6)
-    current = storage.get_batch_row(b6)
-    check(current["status"] == storage.BATCH_RUNNING, "取消前批次仍在 running")
-    # 复刻 runner 取消点 2 的裁决
-    if event.is_set():
-        runner._persist_cancelled_remaining(b6, rule_row["seq"])
-        runner._finish(b6, storage.BATCH_CANCELLED, "用户取消整批，迟到结果已丢弃，不可放行")
-    check(storage.get_batch_row(b6)["status"] == storage.BATCH_CANCELLED,
-          "即使规则零行，取消后批次仍为 cancelled")
-    check(storage.get_rule_rows(b6)[0]["status"] == storage.RULE_CANCELLED,
-          "迟到的通过结论被 cancelled 覆盖")
-    registry.unregister(b6)
+    _test_window_cancel_before_finish(db_clean, good_rule)
+    _test_window_completion_committed_before_cancel(db_clean, good_rule)
+    _test_restart_keeps_cancelled_verdict(db_clean, good_rule)
 
     print(f"\n结果: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0
+
+
+def _wait_registry_clear(bid: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if registry.lifecycle_lock(bid) is None:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"registry for {bid} not cleared in {timeout}s")
+
+
+def _test_window_cancel_before_finish(db_clean: Path, good_rule: list) -> None:
+    """窗口 A：零违规批次通过最后一次取消检查、尚未提交完成状态时取消。
+
+    通过 runner.on_before_finish 钩子把取消精确插入“收尾临界区之前”，
+    时序 100% 确定、不依赖 sleep。预期：取消返回 accepted，批次最终
+    cancelled，can_load 语义为 false，迟到完成不得改写。
+    """
+    print("== 竞态窗口A：最后一次取消检查后、完成落库前收到取消 ==")
+    b6 = "e2e-race-cancel-first"
+    storage.insert_batch(b6, "race-cancel-first", "clean.db",
+                         str(db_clean), good_rule)
+
+    inserted: dict = {}
+
+    def hook(bid: str) -> None:
+        if bid != b6:
+            return
+        # 此刻批次仍为 running，规则已全部落库，但完成状态尚未提交
+        row = storage.get_batch_row(bid)
+        inserted["running_at_hook"] = row["status"]
+        verdict = runner.request_cancel(bid)
+        inserted["verdict"] = verdict
+        # 取消必须在工作线程进入收尾临界区之前就完成裁决
+        inserted["status_after_cancel"] = storage.get_batch_row(bid)["status"]
+
+    runner.on_before_finish = hook
+    try:
+        runner.submit_batch(b6)
+        check(wait_terminal(b6) == storage.BATCH_CANCELLED,
+              "取消先被接受：批次终态必须为 cancelled")
+    finally:
+        runner.on_before_finish = None
+    _wait_registry_clear(b6)
+
+    check(inserted.get("running_at_hook") == storage.BATCH_RUNNING,
+          "钩子触发时批次确实仍在 running（窗口被精确钉住）")
+    check(inserted.get("verdict", {}).get("outcome") == runner.CANCEL_ACCEPTED,
+          f"窗口内取消请求被接受（实际 {inserted.get('verdict')}）")
+    check(inserted.get("status_after_cancel") == storage.BATCH_CANCELLED,
+          "取消接受后控制库立即为 cancelled，工作线程尚未收尾")
+    final = storage.get_batch_row(b6)
+    check(final["status"] == storage.BATCH_CANCELLED, "迟到完成没有改写终态")
+    rule_rows = storage.get_rule_rows(b6)
+    # 规则在取消前已合法落库的结论按“迟到结果不得改写”原则保留；
+    # 不可放行由批次 cancelled 终态保证（can_load 要求 completed）。
+    check(all(r["status"] in (storage.RULE_PASSED, storage.RULE_VIOLATIONS,
+                              storage.RULE_CANCELLED) for r in rule_rows),
+          "规则结论仅来自真实执行或取消回收，无伪造状态（规则状态: "
+          + ",".join(r["status"] for r in rule_rows) + ")")
+    check(final["status"] == storage.BATCH_CANCELLED,
+          "批次级 cancelled 终态保证 can_load=false")
+
+    # 存储层回收语义：已落库结论不得改写，仍排队的规则被回收为 cancelled
+    b6c = "e2e-cancel-reclaim"
+    storage.insert_batch(b6c, "reclaim", "clean.db", str(db_clean),
+                         good_rule + good_rule)
+    storage.set_batch_status(b6c, storage.BATCH_RUNNING)
+    storage.update_rule_result(b6c, 0, status=storage.RULE_VIOLATIONS,
+                               violation_count=3, sample_rows=[{"id": 1}])
+    # seq=1 仍为 queued
+    reclaimed = storage.mark_pending_rules_cancelled(b6c)
+    check(reclaimed == 1, f"仅回收 1 条未裁决规则（实际 {reclaimed}）")
+    rr = storage.get_rule_rows(b6c)
+    check(rr[0]["status"] == storage.RULE_VIOLATIONS
+          and rr[0]["violation_count"] == 3,
+          "已落库结论（含违规计数与明细）不被取消改写")
+    check(rr[1]["status"] == storage.RULE_CANCELLED, "排队规则被回收为 cancelled")
+    # 幂等：再次回收不再产生变化
+    check(storage.mark_pending_rules_cancelled(b6c) == 0, "取消回收幂等")
+    # 终态再取消：明确拒绝
+    again = runner.request_cancel(b6)
+    check(again["outcome"] == runner.CANCEL_REJECTED_TERMINAL,
+          f"终态取消被拒绝（实际 {again}）")
+
+
+def _test_window_completion_committed_before_cancel(db_clean: Path,
+                                                    good_rule: list) -> None:
+    """窗口 B：完成已落库、执行登记尚未清除时收到取消。
+
+    通过 runner.on_after_completion 钩子，在“完成条件 UPDATE 成功之后、
+    生命周期锁释放与执行登记清除之前”精确发起取消，时序 100% 确定。
+    预期：取消明确 rejected_terminal，报告保留 completed 结论；
+    登记清除后的再次取消同样被拒绝。
+    """
+    print("== 竞态窗口B：完成已落库、执行登记未清除时取消被拒绝 ==")
+    b7 = "e2e-race-complete-first"
+    storage.insert_batch(b7, "race-complete-first", "clean.db",
+                         str(db_clean), good_rule)
+    inserted: dict = {}
+
+    def completion_hook(bid: str) -> None:
+        if bid != b7:
+            return
+        inserted["status_at_hook"] = storage.get_batch_row(bid)["status"]
+        inserted["registered_at_hook"] = registry.lifecycle_lock(bid) is not None
+        inserted["verdict"] = runner.request_cancel(bid)
+
+    runner.on_after_completion = completion_hook
+    try:
+        runner.submit_batch(b7)
+        check(wait_terminal(b7) == storage.BATCH_COMPLETED, "批次正常完成")
+    finally:
+        runner.on_after_completion = None
+    _wait_registry_clear(b7)
+
+    check(inserted.get("status_at_hook") == storage.BATCH_COMPLETED,
+          "钩子触发时完成确实已落库（窗口被精确钉住）")
+    check(inserted.get("registered_at_hook") is True,
+          "钩子触发时执行登记确实尚未清除")
+    verdict = inserted.get("verdict")
+    check(verdict is not None
+          and verdict["outcome"] == runner.CANCEL_REJECTED_TERMINAL,
+          f"窗口内取消被明确拒绝（实际 {verdict}）")
+    check(verdict is not None and verdict["status"] == storage.BATCH_COMPLETED,
+          f"拒绝回报的状态为 completed（实际 {None if verdict is None else verdict.get('status')}）")
+    rules = storage.get_rule_rows(b7)
+    check(all(r["status"] == storage.RULE_PASSED for r in rules),
+          "完成报告原样保留，规则结论不被取消改写")
+
+    # 登记清除后的终态取消：同样拒绝，状态保持
+    verdict2 = runner.request_cancel(b7)
+    check(verdict2["outcome"] == runner.CANCEL_REJECTED_TERMINAL
+          and verdict2["status"] == storage.BATCH_COMPLETED,
+          f"登记清除后取消仍被拒绝且报告保留（实际 {verdict2}）")
+    check(storage.get_batch_row(b7)["status"] == storage.BATCH_COMPLETED,
+          "拒绝取消后状态仍为 completed")
+
+
+def _test_restart_keeps_cancelled_verdict(db_clean: Path, good_rule: list) -> None:
+    """取消被接受后重启：cancelled 终态与规则结论必须原样保留。"""
+    print("== 取消结论的重启持久性 ==")
+    b9 = "e2e-race-restart"
+    storage.insert_batch(b9, "race-restart", "clean.db",
+                         str(db_clean), good_rule)
+
+    def hook(bid: str) -> None:
+        if bid == b9:
+            runner.request_cancel(bid)
+
+    runner.on_before_finish = hook
+    try:
+        runner.submit_batch(b9)
+        check(wait_terminal(b9) == storage.BATCH_CANCELLED, "取消批次落 cancelled")
+    finally:
+        runner.on_before_finish = None
+    _wait_registry_clear(b9)
+
+    before = storage.get_batch_row(b9)
+    rules_before = [(r["seq"], r["status"]) for r in storage.get_rule_rows(b9)]
+    # 模拟重启：终态批次不在恢复范围内，结论保持
+    marked = storage.reset_unfinished_on_startup()
+    check(b9 not in marked, "已取消批次不被重启恢复逻辑触碰")
+    after = storage.get_batch_row(b9)
+    rules_after = [(r["seq"], r["status"]) for r in storage.get_rule_rows(b9)]
+    check(after["status"] == storage.BATCH_CANCELLED
+          and after["finished_at"] == before["finished_at"],
+          "重启后 cancelled 终态与 finished_at 保持")
+    check(rules_after == rules_before, "重启后规则结论逐行保持，迟到结果无从改写")
 
 
 if __name__ == "__main__":
